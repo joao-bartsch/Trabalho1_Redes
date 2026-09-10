@@ -1,3 +1,15 @@
+"""
+Classe Jogador: representa um cliente conectado dentro de uma sala.
+
+Guarda a conexão (socket), o endereço, o nome/apelido, a mão atual,
+os pontos, o estado de "pronto" no lobby e uma fila de mensagens
+recebidas (preenchida pela thread leitora da Sala).
+
+A mão é uma lista de strings no formato "valor-naipe"
+(ex: "4-paus"), que serão convertidas em Carta pela Partida.
+"""
+
+import queue
 import socket
 from typing import Optional
 
@@ -17,13 +29,20 @@ class Jogador:
         """
         self.conn = conn
         self.addr = addr
-        self.slot = slot                 # "jogador1" | "jogador2"
-        self.nome: Optional[str] = None  # apelido enviado no "entrar"
-        self.mao: list[str] = []         # ex: ["4-paus", "7-copas", "A-espadas"]
+        self.slot = slot
+        self.nome: Optional[str] = None
+        self.mao: list[str] = []
         self.pontos: int = 0
         self.pronto: bool = False
-        self._buffer: bytes = b""        # buffer de recv por jogador
-        self._vivo: bool = True          # vira False quando a conexão morre
+
+        # Buffer de recv (fragmentação) — usado pela thread leitora.
+        self._buffer: bytes = b""
+
+        # Flag de vida — vira False quando a conexão morre.
+        self._vivo: bool = True
+
+        # Fila de mensagens recebidas (consumida pela Sala ou Partida).
+        self.fila: queue.Queue = queue.Queue()
 
     # --------------------------------------------------------
     # Rede
@@ -61,6 +80,10 @@ class Jogador:
     def fechar(self) -> None:
         """Fecha a conexão, ignorando erros."""
         self._vivo = False
+        try:
+            self.conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         try:
             self.conn.close()
         except OSError:

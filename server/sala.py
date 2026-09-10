@@ -4,26 +4,11 @@ Classe Sala: representa uma sala de jogo com até 2 jogadores.
 Responsabilidades:
     - Guardar o estado da sala (VAZIA, AGUARDANDO_JOGADORES, LOBBY,
       EM_JOGO, FINALIZADA).
-    - Proteger o estado com RLock (acesso concorrente das threads).
-    - Coordenar turnos com uma Condition única (jogadores "dormem"
-      até ser a vez deles).
+    - Proteger o estado com RLock.
+    - Coordenar turnos com uma Condition única.
+    - Criar e gerenciar a thread leitora de cada jogador.
     - Fazer broadcast de mensagens pra todos os jogadores.
-    - Gerenciar lobby (pronto), WO e revanche.
-
-Fluxo de estados:
-    VAZIA
-      → AGUARDANDO_JOGADORES (1 jogador)
-      → LOBBY (2 jogadores, pelo menos 1 ainda não pronto)
-      → EM_JOGO (ambos prontos)
-      → FINALIZADA (fim da partida)
-          ├─ ambos aceitam revanche → volta pra EM_JOGO
-          └─ alguém recusa / cai     → volta pra AGUARDANDO_JOGADORES ou VAZIA
-
-Regra de WO:
-    Se um jogador cair no lobby → o outro continua esperando
-    (sala volta pra AGUARDANDO_JOGADORES).
-    Se um jogador cair durante a partida → o outro vence a partida,
-    sem revanche. Sala volta pra AGUARDANDO_JOGADORES.
+    - Gerenciar lobby (pronto/regras), WO e revanche.
 """
 
 import threading
@@ -35,8 +20,9 @@ from common.excecoes import (
     JogadorJaNaSalaError,
     EstadoSalaInvalidoError,
 )
-
+from server.config import DEBUG
 from server.jogador import Jogador
+from server.regras import TEXTO_REGRAS   # texto fixo das regras
 
 
 # ============================================================
@@ -67,25 +53,24 @@ class Sala:
             "jogador2": None,
         }
 
-        # Partida em andamento (criada quando ambos prontos)
-        self.partida = None   # type: ignore  # será Partida
+        # Partida em andamento
+        self.partida = None   # type: ignore
 
-        # Revanche: {"jogador1": bool, "jogador2": bool}
+        # Revanche
         self.revanche: dict[str, bool] = {
             "jogador1": False,
             "jogador2": False,
         }
 
-        # ---------------------------------------------------
         # Concorrência
-        # ---------------------------------------------------
-        # RLock: protege o estado da sala (estado, jogadores, revanche).
-        # Permite reentrada (evita deadlock em chamadas aninhadas).
         self.lock = threading.RLock()
-
-        # Condition: usada pra sincronizar turnos da partida.
-        # A thread de cada jogador "dorme" até ser a vez dela.
         self.condicao = threading.Condition(self.lock)
+
+        # Threads leitoras (por slot)
+        self.threads_leitoras: dict[str, Optional[threading.Thread]] = {
+            "jogador1": None,
+            "jogador2": None,
+        }
 
     # ========================================================
     # Consultas rápidas
@@ -98,18 +83,15 @@ class Sala:
         return all(j is None for j in self.jogadores.values())
 
     def jogadores_ativos(self) -> list[Jogador]:
-        """Retorna lista (sem Nones) dos jogadores presentes."""
         return [j for j in self.jogadores.values() if j is not None]
 
     def slot_livre(self) -> Optional[str]:
-        """Retorna 'jogador1' ou 'jogador2' se houver vaga, senão None."""
         for slot, j in self.jogadores.items():
             if j is None:
                 return slot
         return None
 
     def adversario_de(self, slot: str) -> Optional[Jogador]:
-        """Retorna o Jogador do outro slot (ou None se não houver)."""
         outro = "jogador2" if slot == "jogador1" else "jogador1"
         return self.jogadores.get(outro)
 
@@ -119,14 +101,8 @@ class Sala:
 
     def adicionar_jogador(self, jogador: Jogador) -> None:
         """
-        Coloca um jogador na sala (no primeiro slot livre).
-
-        Transições:
-            VAZIA → AGUARDANDO_JOGADORES (1 jogador)
-            AGUARDANDO_JOGADORES → LOBBY (2 jogadores)
-
-        Levanta:
-            SalaCheiaError: se a sala já está cheia.
+        Coloca um jogador na sala (primeiro slot livre) e dispara
+        a thread leitora dele.
         """
         with self.lock:
             if self.esta_cheia():
@@ -138,7 +114,6 @@ class Sala:
                     f"(estado: {self.estado})."
                 )
 
-            # Evita duplicar o mesmo jogador (mesmo socket)
             for j in self.jogadores.values():
                 if j is not None and j.conn is jogador.conn:
                     raise JogadorJaNaSalaError(
@@ -152,72 +127,92 @@ class Sala:
             jogador.slot = slot
             self.jogadores[slot] = jogador
 
-            # Atualiza estado
             if self.esta_cheia():
                 self.estado = Estado.LOBBY
             else:
                 self.estado = Estado.AGUARDANDO_JOGADORES
 
-            # Notifica quem estiver esperando (lobby)
+            self._iniciar_thread_leitora(jogador)
             self.condicao.notify_all()
 
-    def remover_jogador(self, slot: str, motivo: str = "desconectado") -> None:
-        """
-        Remove um jogador da sala (por desconexão ou saída voluntária).
+    def _iniciar_thread_leitora(self, jogador: Jogador) -> None:
+        """Cria e inicia a thread leitora do jogador."""
+        t = threading.Thread(
+            target=self._loop_leitura,
+            args=(jogador,),
+            name=f"leitor-{self.id}-{jogador.slot}",
+            daemon=True,
+        )
+        self.threads_leitoras[jogador.slot] = t
+        t.start()
 
-        Regra de WO:
-            - Se havia partida em andamento → adversário vence, sem revanche.
-            - Sala volta pra AGUARDANDO_JOGADORES (se sobrar 1 jogador)
-              ou VAZIA (se não sobrar ninguém).
+    def _loop_leitura(self, jogador: Jogador) -> None:
         """
-        with self.lock:
-            jogador = self.jogadores.get(slot)
-            if jogador is None:
+        Loop de leitura do socket do jogador.
+
+        - Recebe mensagens via protocolo.
+        - Despacha por estado da sala:
+            - LOBBY / AGUARDANDO_JOGADORES → trata aqui mesmo (regras/pronto).
+            - EM_JOGO → enfileira na fila da Partida.
+            - Outros → ignora / erro.
+        - Quando a conexão cai (recv vazio), chama remover_jogador(slot).
+        """
+        while jogador.vivo:
+            msgs = jogador.receber()
+            if not jogador.vivo:
+                # Conexão caiu → remove da sala
+                self.remover_jogador(jogador.slot, motivo="conexão caiu")
                 return
 
-            # Se havia partida em andamento, considera WO
-            if self.estado == Estado.EM_JOGO and self.partida is not None:
-                adversario = self.adversario_de(slot)
-                # Avisa a partida do WO (ela decide o vencedor e encerra)
-                try:
-                    self.partida.registrar_wo(slot)
-                except Exception:
-                    pass  # partida pode já estar encerrando
-                if adversario is not None:
-                    self.broadcast({
-                        "tipo": "desconectando",
-                        "motivo": f"{jogador.nome or slot} desconectou. "
-                                  f"Você venceu a partida por WO.",
-                    })
+            for msg in msgs:
+                self._despachar(jogador, msg)
 
-            # Remove o jogador
-            jogador.fechar()
-            self.jogadores[slot] = None
-            self.partida = None
-            self.revanche = {"jogador1": False, "jogador2": False}
+    def _despachar(self, jogador: Jogador, msg: dict) -> None:
+        """Decide o que fazer com uma mensagem recebida do jogador."""
+        tipo = msg.get("tipo")
+        estado = self.estado
 
-            # Reajusta estado
-            if self.esta_vazia():
-                self.estado = Estado.VAZIA
-            elif self.esta_cheia():
-                self.estado = Estado.LOBBY
-            else:
-                self.estado = Estado.AGUARDANDO_JOGADORES
-
-            self.condicao.notify_all()
+        if estado in (Estado.AGUARDANDO_JOGADORES, Estado.LOBBY):
+            self._tratar_lobby(jogador, msg)
+        elif estado == Estado.EM_JOGO:
+            # Manda pra Partida consumir
+            jogador.fila.put(msg)
+            with self.condicao:
+                self.condicao.notify_all()
+        elif estado == Estado.FINALIZADA:
+            self._tratar_revanche(jogador, msg)
+        else:
+            jogador.enviar({
+                "tipo": "erro",
+                "codigo": "estado_invalido",
+                "msg": f"Ação '{tipo}' não permitida no estado {estado}.",
+            })
 
     # ========================================================
     # Lobby
     # ========================================================
 
-    def marcar_pronto(self, slot: str) -> bool:
-        """
-        Marca um jogador como pronto.
+    def _tratar_lobby(self, jogador: Jogador, msg: dict) -> None:
+        """Trata mensagens recebidas enquanto a sala está no lobby."""
+        tipo = msg.get("tipo")
 
-        Returns:
-            True se ambos ficaram prontos (partida deve iniciar),
-            False caso contrário.
-        """
+        if tipo == p.T_REGRAS:
+            jogador.enviar({"tipo": "regras", "texto": TEXTO_REGRAS})
+
+        elif tipo == p.T_PRONTO:
+            ambos_prontos = self.marcar_pronto(jogador.slot)
+            if ambos_prontos:
+                self.iniciar_partida()
+
+        else:
+            jogador.enviar({
+                "tipo": "erro",
+                "codigo": "acao_invalida_lobby",
+                "msg": f"Ação '{tipo}' não é válida no lobby.",
+            })
+
+    def marcar_pronto(self, slot: str) -> bool:
+        """Marca o jogador como pronto. Retorna True se ambos prontos."""
         with self.lock:
             jogador = self.jogadores.get(slot)
             if jogador is None:
@@ -238,7 +233,6 @@ class Sala:
             return False
 
     def broadcast_estado_lobby(self) -> None:
-        """Envia o estado atual do lobby pra todos os jogadores."""
         with self.lock:
             dados = []
             for slot, j in self.jogadores.items():
@@ -255,28 +249,66 @@ class Sala:
             })
 
     # ========================================================
+    # Remoção de jogador (WO / desconexão)
+    # ========================================================
+
+    def remover_jogador(self, slot: str, motivo: str = "desconectado") -> None:
+        """
+        Remove um jogador da sala.
+
+        - Fecha o socket dele (mata a thread leitora naturalmente).
+        - Se havia partida em andamento, avisa a Partida (WO).
+        - Ajusta o estado da sala.
+        """
+        with self.lock:
+            jogador = self.jogadores.get(slot)
+            if jogador is None:
+                return
+
+            if DEBUG:
+                print(f"[SALA {self.id}] removendo {slot} ({motivo})")
+
+            # Avisa a Partida (se houver) → WO
+            if self.estado == Estado.EM_JOGO and self.partida is not None:
+                try:
+                    self.partida.registrar_wo(slot)
+                except Exception as e:
+                    if DEBUG:
+                        print(f"[SALA {self.id}] erro ao registrar WO: {e}")
+
+            jogador.fechar()
+            self.jogadores[slot] = None
+            self.threads_leitoras[slot] = None
+
+            if self.esta_vazia():
+                self.estado = Estado.VAZIA
+            else:
+                self.estado = Estado.AGUARDANDO_JOGADORES
+                # Reseta pronto do que sobrou
+                for j in self.jogadores.values():
+                    if j is not None:
+                        j.pronto = False
+
+            self.condicao.notify_all()
+
+    # ========================================================
     # Partida
     # ========================================================
 
     def iniciar_partida(self) -> None:
-        """
-        Cria a Partida e muda o estado pra EM_JOGO.
-        Deve ser chamada quando ambos estiverem prontos.
-        """
+        """Cria a Partida e muda o estado pra EM_JOGO."""
         with self.lock:
             if not self.esta_cheia():
                 raise EstadoSalaInvalidoError(
                     "Não é possível iniciar partida sem 2 jogadores."
                 )
 
-            # Import tardio pra evitar dependência circular
             from server.partida import Partida
 
             self.estado = Estado.EM_JOGO
             self.revanche = {"jogador1": False, "jogador2": False}
             self.partida = Partida(self)
 
-            # A Partida roda em uma thread própria (loop de jogo)
             thread_partida = threading.Thread(
                 target=self.partida.rodar,
                 name=f"partida-sala-{self.id}",
@@ -295,15 +327,37 @@ class Sala:
     # Revanche
     # ========================================================
 
-    def registrar_revanche(self, slot: str, aceitou: bool) -> Optional[str]:
-        """
-        Registra o voto de revanche de um jogador.
+    def _tratar_revanche(self, jogador: Jogador, msg: dict) -> None:
+        tipo = msg.get("tipo")
+        if tipo != p.T_REVANCHE:
+            jogador.enviar({
+                "tipo": "erro",
+                "codigo": "acao_invalida_revanche",
+                "msg": f"Ação '{tipo}' não permitida agora.",
+            })
+            return
 
-        Returns:
-            - "reiniciar" se ambos aceitaram
-            - "encerrar"  se alguém recusou
-            - None        se ainda falta o voto do outro
-        """
+        aceitou = msg.get("acao") == "aceitar"
+        resultado = self.registrar_revanche(jogador.slot, aceitou)
+
+        if resultado == "reiniciar":
+            self.broadcast({"tipo": "revanche_inicio"})
+            self.reiniciar_para_revanche()
+        elif resultado == "encerrar":
+            # Um recusou → manda desconectando pros dois
+            self.broadcast({
+                "tipo": "desconectando",
+                "motivo": "Revanche recusada.",
+            })
+            # Fecha os dois sockets (threads leitoras morrem)
+            for slot in list(self.jogadores.keys()):
+                j = self.jogadores.get(slot)
+                if j is not None:
+                    j.fechar()
+                    self.jogadores[slot] = None
+            self.estado = Estado.VAZIA
+
+    def registrar_revanche(self, slot: str, aceitou: bool) -> Optional[str]:
         with self.lock:
             if self.estado != Estado.FINALIZADA:
                 raise EstadoSalaInvalidoError(
@@ -315,7 +369,6 @@ class Sala:
             if not aceitou:
                 return "encerrar"
 
-            # Vê se o outro também já aceitou
             outro = "jogador2" if slot == "jogador1" else "jogador1"
             if self.revanche.get(outro):
                 return "reiniciar"
@@ -323,7 +376,6 @@ class Sala:
             return None
 
     def reiniciar_para_revanche(self) -> None:
-        """Reseta pontos e prontos e inicia uma nova partida."""
         with self.lock:
             for j in self.jogadores.values():
                 if j is not None:
@@ -336,12 +388,10 @@ class Sala:
     # ========================================================
 
     def broadcast(self, mensagem: dict) -> None:
-        """Envia mensagem pra todos os jogadores ativos da sala."""
         for j in self.jogadores_ativos():
             j.enviar(mensagem)
 
     def enviar_para(self, slot: str, mensagem: dict) -> None:
-        """Envia mensagem pra um jogador específico."""
         j = self.jogadores.get(slot)
         if j is not None:
             j.enviar(mensagem)
