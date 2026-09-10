@@ -196,6 +196,8 @@ class Partida:
         self.valor_mao = 1
         self.vitorias_vaza = {SLOT1: 0, SLOT2: 0}
         self.quem_ganhou_vaza_1 = None
+        self._mao_encerrada_por_truco = False
+        self._vencedor_mao_por_truco = None
 
         # Distribui cartas
         baralho = Baralho()
@@ -212,7 +214,8 @@ class Partida:
         vencedor_v1 = self._jogar_vaza(numero=1)
         if self.terminou:
             return None
-
+        if self._mao_encerrada_por_truco:
+            return self._vencedor_mao_por_truco
         if vencedor_v1 is None:
             # Vaza 1 empatou → vai pro "mostrar a maior"
             self._log("Vaza 1 empatou → MOSTRAR A MAIOR")
@@ -226,7 +229,8 @@ class Partida:
         vencedor_v2 = self._jogar_vaza(numero=2)
         if self.terminou:
             return None
-
+        if self._mao_encerrada_por_truco:
+            return self._vencedor_mao_por_truco
         if vencedor_v2 is not None:
             self.vitorias_vaza[vencedor_v2] += 1
 
@@ -241,7 +245,8 @@ class Partida:
         vencedor_v3 = self._jogar_vaza(numero=3)
         if self.terminou:
             return None
-
+        if self._mao_encerrada_por_truco:
+            return self._vencedor_mao_por_truco
         if vencedor_v3 is not None:
             self.vitorias_vaza[vencedor_v3] += 1
 
@@ -278,6 +283,10 @@ class Partida:
             carta = self._aguardar_jogada(slot)
             if self.terminou:
                 return None
+
+            if self._mao_encerrada_por_truco:
+                return None
+
             if carta is None:
                 # Timeout → WO
                 self._log(f"Timeout de {slot} → WO")
@@ -351,6 +360,8 @@ class Partida:
                 # Truco NÃO consome a vez — resolve e volta a esperar
                 if not self._iniciar_truco(slot):
                     return None  # WO durante o truco
+                if self._mao_encerrada_por_truco:
+                    return None
                 continue
 
             if tipo == p.T_JOGAR:
@@ -580,10 +591,10 @@ class Partida:
             if acao == "correr":
                 # Adversário ganha o valor ANTERIOR
                 valor_ganho = VALORES_NIVEL[self.nivel_truco - 1]
+                self.valor_mao = valor_ganho
                 self._log(
                     f"{outro} correu. {slot_pediu} ganha {valor_ganho}."
                 )
-                self.placar[slot_pediu] += valor_ganho
                 self.sala.broadcast({
                     "tipo": p.T_TRUCO_CORRIDO,
                     "quem_correu": outro,
