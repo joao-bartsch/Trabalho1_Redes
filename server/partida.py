@@ -233,6 +233,9 @@ class Partida:
             return self._vencedor_mao_por_truco
         if vencedor_v2 is not None:
             self.vitorias_vaza[vencedor_v2] += 1
+        if vencedor_v2 is None:
+            self._log("Vaza 2 empatou → Vence quem ganhou a 1ª vaza!")
+            return self.quem_ganhou_vaza_1
 
         # Alguém fez 2?
         if self.vitorias_vaza[SLOT1] == 2:
@@ -241,7 +244,7 @@ class Partida:
             return SLOT2
 
         # Vaza 3
-        self.quem_comecou_vaza = vencedor_v1  # começa quem ganhou a 1ª
+        self.quem_comecou_vaza = vencedor_v2  # começa quem ganhou a 1ª
         vencedor_v3 = self._jogar_vaza(numero=3)
         if self.terminou:
             return None
@@ -308,6 +311,7 @@ class Partida:
             return None
 
         resultado = comparar(c1, c2)
+        print(f"[TESTE VAZA] Resultado do comparar({c1}, {c2}) = {resultado}")
         if resultado == 0:
             self._log(f"Vaza {numero} EMPATOU ({c1} vs {c2})")
             self.sala.broadcast({
