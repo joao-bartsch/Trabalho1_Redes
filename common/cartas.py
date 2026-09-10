@@ -118,9 +118,6 @@ class Carta:
             return MANILHAS[chave]
         return FORCA_VALOR[self.valor]
 
-    def naipe_forca(self) -> int:
-        """Força do naipe (paus > copas > espadas > ouros)."""
-        return FORCA_NAIPE[self.naipe]
 
     def to_dict(self) -> dict:
         """Serializa pra JSON (útil no protocolo)."""
@@ -138,8 +135,7 @@ def comparar(a: Carta, b: Carta) -> int:
     Returns:
          1 se a > b
         -1 se a < b
-         0 se empatarem em força E naipe (mesma carta) — não deveria
-           acontecer no jogo real, mas fica como segurança.
+         0 se empatarem em força (ex: duas Damas, dois Reis, etc.)
     """
     fa, fb = a.forca(), b.forca()
 
@@ -148,14 +144,9 @@ def comparar(a: Carta, b: Carta) -> int:
     if fa < fb:
         return -1
 
-    # Mesma força: desempata por naipe
-    na, nb = a.naipe_forca(), b.naipe_forca()
-    if na > nb:
-        return 1
-    if na < nb:
-        return -1
-
-    # Mesma força E mesmo naipe → mesma carta (empate exato)
+    # Se a força é igual:
+    # No Truco, manilhas já possuem forças distintas (11, 12, 13, 14).
+    # Cartas normais de mesmo valor (ex: duas Damas) empatam (retornam 0)!
     return 0
 
 
