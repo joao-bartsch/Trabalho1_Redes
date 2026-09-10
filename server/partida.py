@@ -1035,3 +1035,5 @@ class Partida:
     def _log(self, texto: str) -> None:
         if DEBUG:
             print(f"[PARTIDA {self.sala.id}] {texto}")
+
+#teste
