@@ -1,13 +1,8 @@
-"""
-Texto fixo das regras do Truco Mineiro.
 
-Enviado ao cliente quando ele manda {"tipo": "regras"}.
-Não contém lógica — só texto informativo.
-"""
 
 TEXTO_REGRAS = """
 ============================================================
-                    TRUCO MINEIRO
+                    TRUCO ONLINE
 ============================================================
 
 CARTAS
@@ -26,7 +21,7 @@ Desempate por naipe (quando valores iguais):
 MÃO
 ---
 Melhor de 3 vazas. Quem ganhar 2 leva a mão.
-Se a 1ª vaza empatar → vai direto pro "mostrar a maior".
+Se a 1ª vaza (queda, rodada, etc) empatar → vai direto pro "mostrar a maior".
 Se a 3ª vaza empatar → vence quem ganhou a 1ª vaza.
 Se todas empatarem → ninguém pontua, nova mão.
 
@@ -75,4 +70,18 @@ WO
 Se um jogador cair durante a partida, o outro vence por WO.
 Se cair no lobby, a sala volta pra "aguardando jogadores".
 ============================================================
+
+COMANDOS 
+--
+'regras' → mostra as regras do jogo
+'pronto' → pronto para jogar (ou iniciar a partida)
+'jogar + nome da carta' → jogar carta da mão (ex: jogar 4-paus)
+'truco' → pedir truco (ou retruco, vale-nove, vale-doze)
+    dentro do truco:
+    'correr' → desistir da mão (perde o valor atual)
+    'aceitar' → aceitar o truco (ou retruco, vale-nove, vale-doze)
+    'aumentar' → aumentar o truco (ou retruco, vale-nove, vale-doze)
+'revelar + nome da maior carta' → revelar a maior carta da mão (ex: revelar 4-paus)
+'jogar11' → jogar a mão de 11 pontos
+'correr11' → desistir da mão de 11 pontos
 """
