@@ -1,15 +1,3 @@
-"""
-Cliente de teste do Truco Mineiro.
-
-- Conecta no servidor.
-- Manda 'entrar' com o nome e 'pronto' automaticamente.
-- Fica recebendo mensagens do servidor e mostrando no terminal.
-- Lê comandos do usuário pra enviar ações (jogar, truco, etc).
-
-Este módulo é provisório — depois vira a base do cliente "de verdade"
-com interface mais amigável.
-"""
-
 import socket
 import threading
 import time
