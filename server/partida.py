@@ -1,5 +1,5 @@
 """
-Classe Partida: roda o jogo do Truco Mineiro dentro de uma Sala.
+Classe Partida: roda o jogo do Truco dentro de uma Sala.
 
 Responsabilidades:
     - Sorteio inicial, alternância de quem começa a mão.
@@ -23,11 +23,6 @@ from typing import Optional
 
 from common.cartas import Carta, Baralho, comparar, maior_carta
 from common import protocolo as p
-from common.excecoes import (
-    JogadaInvalidaError,
-    TrucoInvalidoError,
-    MostrarMaiorInvalidoError,
-)
 from server.config import (
     DEBUG,
     PONTOS_PARTIDA,
@@ -48,12 +43,22 @@ from server.sala import Sala
 SLOT1 = "jogador1"
 SLOT2 = "jogador2"
 
+# Valor da mão em cada nível de truco (0 = mão normal).
+# O índice é o nível atual; o valor é quantos pontos vale a mão.
 VALORES_NIVEL = {
     0: 1,    # mão normal
     1: 3,    # truco
     2: 6,    # retruco
     3: 9,    # vale-nove
     4: 12,   # vale-doze
+}
+
+# Nome amigável de cada nível (usado só em logs/mensagens).
+NOMES_NIVEL = {
+    1: "truco",
+    2: "retruco",
+    3: "vale-nove",
+    4: "vale-doze",
 }
 
 
@@ -66,12 +71,12 @@ class Partida:
     def __init__(self, sala: Sala):
         self.sala = sala
 
-        # Atalhos
+        # Atalhos pros dois jogadores
         self.j1 = sala.jogadores[SLOT1]
         self.j2 = sala.jogadores[SLOT2]
         self.jogadores = {SLOT1: self.j1, SLOT2: self.j2}
 
-        # Placar
+        # Placar acumulado da partida (vai até 12)
         self.placar = {SLOT1: 0, SLOT2: 0}
 
         # Controle global
@@ -80,8 +85,8 @@ class Partida:
 
         # Estado da mão atual
         self.comeca_mao: Optional[str] = None
-        self.nivel_truco = 0                # 0=normal, 1=truco, 2=retruco...
-        self.valor_mao = 1                  # pontos em disputa nesta mão
+        self.nivel_truco = 0       # 0=sem truco, 1=truco, 2=retruco...
+        self.valor_mao = 1         # quantos pontos vale a mão atual
 
         # Estado da vaza atual
         self.cartas_na_mesa: dict[str, Optional[Carta]] = {
@@ -91,22 +96,43 @@ class Partida:
         self.quem_ganhou_vaza_1: Optional[str] = None
         self.quem_comecou_vaza: Optional[str] = None
 
+        # Controle de truco corrido: quando alguém corre, a mão
+        # NÃO termina imediatamente aqui dentro — sinalizamos via essas
+        # flags e quem decide o vencedor é o loop principal (rodar()).
+        self._mao_encerrada_por_truco = False
+        self._vencedor_mao_por_truco: Optional[str] = None
+        self._pontos_mao_por_truco = 0
+
+        # Controle da mão de 11
+        self._em_mao_de_11 = False
+        # Quantos pontos o vencedor da mão de 11 leva.
+        # Regra: quem tem 11 e GANHA leva 1; quem tem 11 e PERDE dá 3.
+        self._pontos_mao_11 = 0
+
     # ========================================================
     # LOOP PRINCIPAL
     # ========================================================
 
     def rodar(self) -> None:
-        """Loop principal da partida (roda em thread própria)."""
+        """
+        Loop principal da partida (roda em thread própria).
+
+        Ciclo:
+            1. Se alguém já fez 12+, encerra.
+            2. Decide o tipo da próxima mão (normal / 11 / ferro).
+            3. Executa a mão (retorna o slot vencedor ou None).
+            4. Atualiza placar e broadcast de fim de mão.
+            5. Alterna quem começa e repete.
+        """
         try:
             self._log("PARTIDA INICIADA")
             self._sortear_quem_comeca()
 
             while not self.terminou:
-                # Verifica se alguém já venceu por pontos
+                # Encerra se alguém já bateu 12
                 if self._alguem_atingiu_12():
                     break
 
-                # Decide tipo de mão
                 tipo = self._tipo_de_mao()
 
                 if tipo == "ferro":
@@ -119,27 +145,64 @@ class Partida:
                 if self.terminou:
                     break
 
-                # Atualiza placar
-                if vencedor is not None:
-                    self.placar[vencedor] += self.valor_mao
+                # ------------------------------------------------
+                # Atualiza placar conforme o resultado da mão.
+                # ------------------------------------------------
+                # Caso especial: mão encerrada por truco corrido.
+                # O placar já foi somado dentro do _iniciar_truco,
+                # então aqui só sinalizamos o fim da mão.
+                if self._mao_encerrada_por_truco:
+                    vencedor = self._vencedor_mao_por_truco
                     self._log(
-                        f"FIM DA MÃO: {vencedor} ganhou "
-                        f"{self.valor_mao} ponto(s). "
+                        f"Mão encerrada por truco corrido. "
                         f"Placar: {self.placar}"
                     )
                     self.sala.broadcast({
-                        "tipo": "fim_mao",
+                        "tipo": p.T_FIM_MAO,
+                        "vencedor": vencedor,
+                        "pontos": dict(self.placar),
+                    })
+                    self._mao_encerrada_por_truco = False
+                    self._vencedor_mao_por_truco = None
+                    self._pontos_mao_por_truco = 0
+
+                # Caso normal
+                elif vencedor is not None:
+                    # Mão de 11 tem valor especial:
+                    #   - se o jogador de 11 GANHOU: +1
+                    #   - se o jogador de 11 PERDEU: adversário +3
+                    if self._em_mao_de_11:
+                        pontos = self._pontos_mao_11 or self.valor_mao
+                        self.placar[vencedor] += pontos
+                        self._log(
+                            f"FIM DA MÃO DE 11: {vencedor} ganhou "
+                            f"{pontos} ponto(s). Placar: {self.placar}"
+                        )
+                    else:
+                        self.placar[vencedor] += self.valor_mao
+                        self._log(
+                            f"FIM DA MÃO: {vencedor} ganhou "
+                            f"{self.valor_mao} ponto(s). "
+                            f"Placar: {self.placar}"
+                        )
+
+                    self.sala.broadcast({
+                        "tipo": p.T_FIM_MAO,
                         "vencedor": vencedor,
                         "pontos": dict(self.placar),
                     })
 
-                # Alterna quem começa a próxima mão
+                    # Reset dos controles de mão de 11
+                    self._em_mao_de_11 = False
+                    self._pontos_mao_11 = 0
+
+                # Alterna quem começa a próxima mão (J1 ↔ J2)
                 self.comeca_mao = SLOT2 if self.comeca_mao == SLOT1 else SLOT1
 
-                # Pequeno delay pra não floodar
+                # Pequeno delay pra não floodar clientes
                 time.sleep(0.5)
 
-            # Determina vencedor final
+            # Fim de partida: vencedor por WO tem prioridade.
             if self.vencedor_wo:
                 vencedor = self.vencedor_wo
             else:
@@ -159,14 +222,17 @@ class Partida:
     # ========================================================
 
     def _sortear_quem_comeca(self) -> None:
+        """Sorteia quem começa a primeira mão (só na 1ª)."""
         self.comeca_mao = random.choice([SLOT1, SLOT2])
         self._log(f"Sorteio: {self.comeca_mao} começa a partida.")
 
     def _alguem_atingiu_12(self) -> bool:
-        return self.placar[SLOT1] >= PONTOS_PARTIDA or \
-               self.placar[SLOT2] >= PONTOS_PARTIDA
+        """True se algum jogador chegou (ou passou) de 12 pontos."""
+        return (self.placar[SLOT1] >= PONTOS_PARTIDA or
+                self.placar[SLOT2] >= PONTOS_PARTIDA)
 
     def _quem_atingiu_12(self) -> Optional[str]:
+        """Retorna o slot do vencedor por pontos (ou None)."""
         if self.placar[SLOT1] >= PONTOS_PARTIDA:
             return SLOT1
         if self.placar[SLOT2] >= PONTOS_PARTIDA:
@@ -174,7 +240,12 @@ class Partida:
         return None
 
     def _tipo_de_mao(self) -> str:
-        """Retorna 'normal', 'onze' ou 'ferro' conforme o placar."""
+        """
+        Decide o tipo da próxima mão conforme o placar:
+            - 'ferro'  : ambos com 11
+            - 'onze'   : alguém com 11
+            - 'normal' : caso contrário
+        """
         p1 = self.placar[SLOT1]
         p2 = self.placar[SLOT2]
         if p1 == 11 and p2 == 11:
@@ -188,68 +259,91 @@ class Partida:
     # ========================================================
 
     def _mao_normal(self) -> Optional[str]:
-        """Executa uma mão normal (3 vazas, com mostrar a maior)."""
+        """
+        Executa uma mão normal.
+
+        Fluxo:
+            - Vaza 1: quem começa joga primeiro.
+                - Se NÃO empatar → continua pra vaza 2.
+                - Se EMPATAR → vai direto pro 'mostrar a maior' e acaba.
+            - Vaza 2: se alguém fizer 2 vitórias → mão acaba.
+            - Vaza 3: quem ganhar leva a mão. Empate → quem ganhou a 1ª.
+
+        Retorna o slot vencedor ou None (se houve WO/truco corrido).
+        """
         self._log(f"--- MÃO NORMAL (começa: {self.comeca_mao}) ---")
 
-        # Reseta estado da mão
+        # Reseta o estado da mão
         self.nivel_truco = 0
         self.valor_mao = 1
         self.vitorias_vaza = {SLOT1: 0, SLOT2: 0}
         self.quem_ganhou_vaza_1 = None
         self._mao_encerrada_por_truco = False
         self._vencedor_mao_por_truco = None
+        self._pontos_mao_por_truco = 0
+        self._em_mao_de_11 = False
 
-        # Distribui cartas
+        # Distribui 3 cartas pra cada
         baralho = Baralho()
         baralho.embaralhar()
         for slot, jog in self.jogadores.items():
             mao = baralho.distribuir(3)
             jog.mao = [str(c) for c in mao]
 
-        # Envia mao_inicial
         self._enviar_mao_inicial()
 
-        # Vaza 1
+        # -------------------- VAZA 1 --------------------
         self.quem_comecou_vaza = self.comeca_mao
         vencedor_v1 = self._jogar_vaza(numero=1)
+
         if self.terminou:
             return None
         if self._mao_encerrada_por_truco:
             return self._vencedor_mao_por_truco
+
         if vencedor_v1 is None:
-            # Vaza 1 empatou → vai pro "mostrar a maior"
+            # Vaza 1 empatou → não tem vaza 2 nem 3.
             self._log("Vaza 1 empatou → MOSTRAR A MAIOR")
-            return self._mostrar_a_maior(quem_revela_primeiro=self.comeca_mao)
+            return self._mostrar_a_maior(
+                quem_revela_primeiro=self.comeca_mao
+            )
 
         self.vitorias_vaza[vencedor_v1] += 1
         self.quem_ganhou_vaza_1 = vencedor_v1
 
-        # Vaza 2
+        # -------------------- VAZA 2 --------------------
+        # Quem ganhou a vaza 1 começa a vaza 2.
         self.quem_comecou_vaza = vencedor_v1
         vencedor_v2 = self._jogar_vaza(numero=2)
+
         if self.terminou:
             return None
         if self._mao_encerrada_por_truco:
             return self._vencedor_mao_por_truco
-        if vencedor_v2 is not None:
-            self.vitorias_vaza[vencedor_v2] += 1
+
         if vencedor_v2 is None:
+            # Empate na vaza 2 → vence quem ganhou a vaza 1
             self._log("Vaza 2 empatou → Vence quem ganhou a 1ª vaza!")
             return self.quem_ganhou_vaza_1
 
-        # Alguém fez 2?
+        self.vitorias_vaza[vencedor_v2] += 1
+
+        # Alguém já fez 2 vitórias? Então a mão acabou.
         if self.vitorias_vaza[SLOT1] == 2:
             return SLOT1
         if self.vitorias_vaza[SLOT2] == 2:
             return SLOT2
 
-        # Vaza 3
-        self.quem_comecou_vaza = vencedor_v2  # começa quem ganhou a 1ª
+        # -------------------- VAZA 3 --------------------
+        # Quem ganhou a vaza 2 começa a vaza 3.
+        self.quem_comecou_vaza = vencedor_v2
         vencedor_v3 = self._jogar_vaza(numero=3)
+
         if self.terminou:
             return None
         if self._mao_encerrada_por_truco:
             return self._vencedor_mao_por_truco
+
         if vencedor_v3 is not None:
             self.vitorias_vaza[vencedor_v3] += 1
 
@@ -264,29 +358,40 @@ class Partida:
 
     def _jogar_vaza(self, numero: int) -> Optional[str]:
         """
-        Executa uma vaza. Retorna o slot do vencedor,
-        None se empatou, ou None com terminou=True se houve WO.
+        Executa uma vaza completa.
+
+        - Ordem: quem começou a vaza joga primeiro, depois o outro.
+        - Cada jogador recebe 'sua_vez' e o servidor espera a jogada.
+        - Ao final, compara as cartas e faz broadcast do vencedor.
+
+        Retorna:
+            - slot vencedor (SLOT1/SLOT2)
+            - None se empatou
+            - None se houve WO / truco corrido (checar flags externas)
         """
-        self._log(f"--- VAZA {numero} (começa: {self.quem_comecou_vaza}) ---")
+        self._log(
+            f"--- VAZA {numero} (começa: {self.quem_comecou_vaza}) ---"
+        )
 
         self.cartas_na_mesa = {SLOT1: None, SLOT2: None}
 
-        # Ordem: quem começa, depois o outro
-        ordem = [self.quem_comecou_vaza,
-                 SLOT2 if self.quem_comecou_vaza == SLOT1 else SLOT1]
+        ordem = [
+            self.quem_comecou_vaza,
+            SLOT2 if self.quem_comecou_vaza == SLOT1 else SLOT1,
+        ]
 
         for slot in ordem:
             if self.terminou:
                 return None
 
-            # Sinaliza a vez
+            # Avisa o jogador que é a vez dele
             self.sala.enviar_para(slot, {"tipo": p.T_SUA_VEZ})
 
-            # Espera jogada (ou truco) com timeout
+            # Espera a jogada (ou truco no meio)
             carta = self._aguardar_jogada(slot)
+
             if self.terminou:
                 return None
-
             if self._mao_encerrada_por_truco:
                 return None
 
@@ -296,6 +401,7 @@ class Partida:
                 self.registrar_wo(slot)
                 return None
 
+            # Guarda a carta e avisa os dois
             self.cartas_na_mesa[slot] = carta
             self.sala.broadcast({
                 "tipo": p.T_CARTA_JOGADA,
@@ -303,7 +409,7 @@ class Partida:
                 "carta": str(carta),
             })
 
-        # Resolve a vaza
+        # As duas cartas estão na mesa: resolve a vaza
         c1 = self.cartas_na_mesa[SLOT1]
         c2 = self.cartas_na_mesa[SLOT2]
 
@@ -311,7 +417,7 @@ class Partida:
             return None
 
         resultado = comparar(c1, c2)
-        print(f"[TESTE VAZA] Resultado do comparar({c1}, {c2}) = {resultado}")
+
         if resultado == 0:
             self._log(f"Vaza {numero} EMPATOU ({c1} vs {c2})")
             self.sala.broadcast({
@@ -338,11 +444,16 @@ class Partida:
         """
         Espera o jogador 'slot' jogar uma carta.
 
-        Enquanto espera, pode receber 'truco' (que NÃO consome a vez)
-        e resolver o fluxo do truco — depois volta a esperar a jogada.
+        Detalhe importante: o pedido de truco NÃO consome a vez.
+        Se o jogador mandar 'truco', o servidor resolve o fluxo
+        (aceitar/correr/aumentar) e VOLTA a esperar a jogada dele.
+
+        Exceção: durante a mão de 11, truco é proibido.
 
         Retorna:
-            Carta jogada, ou None em caso de timeout/WO.
+            - Carta jogada
+            - None em caso de timeout/WO/truco corrido
+              (checar self.terminou e self._mao_encerrada_por_truco)
         """
         deadline = time.time() + TIMEOUT_JOGADA
 
@@ -360,14 +471,31 @@ class Partida:
 
             tipo = msg.get("tipo")
 
+            # ------------------------------------------------
+            # TRUCO (não consome a vez)
+            # ------------------------------------------------
             if tipo == p.T_TRUCO:
-                # Truco NÃO consome a vez — resolve e volta a esperar
+                # Regra: não se pode trucar na mão de 11 (individual
+                # ou de ferro). Se o jogador tentar, devolve erro
+                # e continua esperando a jogada.
+                if self._em_mao_de_11:
+                    self.sala.enviar_para(slot, {
+                        "tipo": p.T_ERRO,
+                        "codigo": "truco_proibido_mao_11",
+                        "msg": "Não é permitido trucar na mão de 11.",
+                    })
+                    continue
+
                 if not self._iniciar_truco(slot):
                     return None  # WO durante o truco
+
                 if self._mao_encerrada_por_truco:
-                    return None
+                    return None  # truco corrido → mão acaba
                 continue
 
+            # ------------------------------------------------
+            # JOGAR
+            # ------------------------------------------------
             if tipo == p.T_JOGAR:
                 carta_str = msg.get("carta")
                 try:
@@ -380,7 +508,6 @@ class Partida:
                     })
                     continue
 
-                # Valida se está na mão
                 if str(carta) not in self.jogadores[slot].mao:
                     self.sala.enviar_para(slot, {
                         "tipo": p.T_ERRO,
@@ -389,7 +516,7 @@ class Partida:
                     })
                     continue
 
-                # Remove da mão
+                # Remove da mão e devolve pro chamador
                 self.jogadores[slot].mao.remove(str(carta))
                 return carta
 
@@ -399,14 +526,24 @@ class Partida:
     # MOSTRAR A MAIOR
     # ========================================================
 
-    def _mostrar_a_maior(self, quem_revela_primeiro: str) -> Optional[str]:
+    def _mostrar_a_maior(
+        self, quem_revela_primeiro: str
+    ) -> Optional[str]:
         """
-        Executa o fluxo de 'mostrar a maior' (só quando a vaza 1 empata).
+        Executa o fluxo de 'mostrar a maior'.
 
-        - Quem começou a vaza 1 revela primeiro.
-        - O segundo pode trucar antes de revelar.
-        - Sem truco: quem tiver a maior ganha 1 ponto.
-        - Com truco aceito: quem tiver a maior ganha 3 pontos.
+        Ocorre APENAS quando a vaza 1 empata.
+
+        Assimetria proposital:
+            - O primeiro jogador (quem começou a vaza 1) revela
+              SEM ver a carta do adversário.
+            - O segundo PODE trucar depois de ver a carta revelada,
+              aproveitando a informação.
+
+        Valores:
+            - Sem truco aceito: quem tem a maior ganha 1 ponto.
+            - Truco aceito: quem tem a maior ganha o valor do truco
+              (3, 6, 9 ou 12).
         """
         self.nivel_truco = 0
         self.valor_mao = 1
@@ -418,7 +555,7 @@ class Partida:
             "primeiro": quem_revela_primeiro,
         })
 
-        # 1) Primeiro revela
+        # 1) Primeiro revela (sem ver nada do outro)
         carta1 = self._aguardar_revelacao(quem_revela_primeiro)
         if self.terminou:
             return None
@@ -432,7 +569,8 @@ class Partida:
             "carta": str(carta1),
         })
 
-        # 2) Segundo pode trucar antes de revelar (ou revelar direto)
+        # 2) Segundo pode trucar OU revelar direto.
+        #    Se trucar, resolve antes de revelar.
         carta2 = self._aguardar_revelacao_ou_truco(outro)
         if self.terminou:
             return None
@@ -446,10 +584,11 @@ class Partida:
             "carta": str(carta2),
         })
 
-        # 3) Decide quem ganha
+        # 3) Decide vencedor
         resultado = comparar(carta1, carta2)
         if resultado == 0:
-            # Não deveria acontecer (cartas únicas no baralho)
+            # Não deveria acontecer (cartas únicas no baralho),
+            # mas em caso de empate exato, quem revelou primeiro leva.
             vencedor = quem_revela_primeiro
         else:
             vencedor = quem_revela_primeiro if resultado > 0 else outro
@@ -467,7 +606,7 @@ class Partida:
         return vencedor
 
     def _aguardar_revelacao(self, slot: str) -> Optional[Carta]:
-        """Espera a revelação da maior carta de um jogador."""
+        """Espera a revelação da maior carta de um jogador (sem truco)."""
         msg = self._esperar_mensagem(
             slot,
             tipos_validos={p.T_REVELAR_MAIOR},
@@ -480,7 +619,10 @@ class Partida:
     def _aguardar_revelacao_ou_truco(self, slot: str) -> Optional[Carta]:
         """
         Espera do segundo jogador: revelar a maior OU trucar.
-        Se trucar, resolve o truco e depois espera a revelação.
+
+        Se ele trucar, resolve o truco (aceitar/correr/aumentar) e
+        depois volta a esperar a revelação. Isso explora a assimetria
+        proposital do 'mostrar a maior'.
         """
         deadline = time.time() + TIMEOUT_REVELAR_MAIOR
 
@@ -508,7 +650,13 @@ class Partida:
         return None
 
     def _validar_revelacao(self, slot: str, msg: dict) -> Optional[Carta]:
-        """Valida se a carta revelada é a maior da mão do jogador."""
+        """
+        Valida se a carta revelada é de fato a maior da mão do jogador.
+
+        Regras:
+            - A carta precisa estar na mão.
+            - A carta precisa ser a maior da mão (regra do jogo).
+        """
         carta_str = msg.get("carta")
         try:
             carta = Carta.from_str(carta_str)
@@ -548,11 +696,22 @@ class Partida:
         """
         Inicia o fluxo de truco.
 
+        Funcionamento:
+            - Sobe o nível atual (truco → retruco → vale-nove → vale-doze).
+            - Envia 'truco_pedido' pro adversário.
+            - Espera resposta:
+                - 'aceitar'   → só sobe o valor da mão e segue o jogo.
+                - 'correr'    → adversário ganha o valor ANTERIOR.
+                                Marca a mão como encerrada via flags.
+                - 'aumentar'  → inverte os papéis e continua o loop.
+            - Pode acontecer várias vezes seguidas (aumentos sucessivos).
+
         Retorna:
-            True se o truco foi resolvido (aceito/corrido/aumentado) OK.
-            False se houve WO durante o processo.
+            True  → truco resolvido (aceito ou corrido)
+            False → houve WO durante o processo
         """
         if self.nivel_truco >= 4:
+            # Já está no máximo (vale-doze), não pode subir mais.
             self.sala.enviar_para(slot_pediu, {
                 "tipo": p.T_ERRO,
                 "codigo": "truco_maximo",
@@ -560,16 +719,16 @@ class Partida:
             })
             return True
 
-        # Sobe o nível e o valor
+        # Sobe o nível e recalcula o valor da mão
         self.nivel_truco += 1
         self.valor_mao = VALORES_NIVEL[self.nivel_truco]
-        nome = {1: "truco", 2: "retruco", 3: "vale-nove", 4: "vale-doze"}[
-            self.nivel_truco
-        ]
+        nome = NOMES_NIVEL[self.nivel_truco]
 
         outro = SLOT2 if slot_pediu == SLOT1 else SLOT1
 
-        self._log(f"{slot_pediu} pediu {nome} (valor {self.valor_mao})")
+        self._log(
+            f"{slot_pediu} pediu {nome} (valor {self.valor_mao})"
+        )
 
         self.sala.enviar_para(outro, {
             "tipo": p.T_TRUCO_PEDIDO,
@@ -577,7 +736,7 @@ class Partida:
             "valor": self.valor_mao,
         })
 
-        # Espera resposta (aceitar/correr/aumentar)
+        # Loop de respostas — permite aumentos sucessivos.
         while True:
             msg = self._esperar_mensagem(
                 outro,
@@ -592,25 +751,35 @@ class Partida:
 
             acao = msg.get("acao")
 
+            # ------------------------------------------------
+            # CORRER → quem pediu ganha o valor ANTERIOR
+            # ------------------------------------------------
             if acao == "correr":
-                # Adversário ganha o valor ANTERIOR
                 valor_ganho = VALORES_NIVEL[self.nivel_truco - 1]
                 self.valor_mao = valor_ganho
+
                 self._log(
                     f"{outro} correu. {slot_pediu} ganha {valor_ganho}."
                 )
+
+                # Soma os pontos AQUI e sinaliza pro loop principal
+                # que a mão acabou por truco corrido.
+                self.placar[slot_pediu] += valor_ganho
+                self._mao_encerrada_por_truco = True
+                self._vencedor_mao_por_truco = slot_pediu
+                self._pontos_mao_por_truco = valor_ganho
+
                 self.sala.broadcast({
                     "tipo": p.T_TRUCO_CORRIDO,
                     "quem_correu": outro,
                     "vencedor": slot_pediu,
                     "pontos": valor_ganho,
                 })
-                # Marca que a mão acabou (quem chamou leva)
-                self._mao_encerrada_por_truco = True
-                self._vencedor_mao_por_truco = slot_pediu
-                self._pontos_mao_por_truco = valor_ganho
                 return True
 
+            # ------------------------------------------------
+            # ACEITAR → só sobe o valor da mão
+            # ------------------------------------------------
             if acao == "aceitar":
                 self._log(f"{outro} aceitou {nome}.")
                 self.sala.broadcast({
@@ -619,6 +788,9 @@ class Partida:
                 })
                 return True
 
+            # ------------------------------------------------
+            # AUMENTAR → inverte papéis e continua o loop
+            # ------------------------------------------------
             if acao == "aumentar":
                 if self.nivel_truco >= 4:
                     self.sala.enviar_para(outro, {
@@ -627,13 +799,13 @@ class Partida:
                         "msg": "Não é possível aumentar além do vale-doze.",
                     })
                     continue
-                # Inverte: agora quem pediu é o 'outro'
+
+                # Quem respondeu vira quem pede.
                 slot_pediu, outro = outro, slot_pediu
                 self.nivel_truco += 1
                 self.valor_mao = VALORES_NIVEL[self.nivel_truco]
-                nome = {2: "retruco", 3: "vale-nove", 4: "vale-doze"}[
-                    self.nivel_truco
-                ]
+                nome = NOMES_NIVEL[self.nivel_truco]
+
                 self._log(f"{slot_pediu} aumentou para {nome}.")
                 self.sala.enviar_para(outro, {
                     "tipo": p.T_TRUCO_PEDIDO,
@@ -642,6 +814,7 @@ class Partida:
                 })
                 continue
 
+            # Ação desconhecida
             self.sala.enviar_para(outro, {
                 "tipo": p.T_ERRO,
                 "codigo": "resposta_invalida",
@@ -653,14 +826,29 @@ class Partida:
     # ========================================================
 
     def _mao_de_11(self) -> Optional[str]:
-        """Executa a mão de 11. Retorna slot vencedor ou None."""
+        """
+        Executa a mão de 11.
+
+        Regras:
+            - Só o jogador com 11 vê as cartas e decide.
+            - 'correr'  → adversário ganha 1 ponto.
+            - 'jogar'   → mão normal (3 vazas, SEM truco):
+                - se o jogador de 11 GANHAR → ele ganha 1 ponto
+                - se o jogador de 11 PERDER → adversário ganha 3 pontos
+
+        Retorna slot vencedor, ou None (WO).
+        """
         self._log("--- MÃO DE 11 ---")
+
+        # Marca o estado pra bloquear truco em _aguardar_jogada
+        self._em_mao_de_11 = True
+        self._pontos_mao_11 = 0
 
         # Descobre quem tem 11
         slot_11 = SLOT1 if self.placar[SLOT1] == 11 else SLOT2
         outro = SLOT2 if slot_11 == SLOT1 else SLOT1
 
-        # Distribui cartas pro jogador com 11 (só pra ele ver)
+        # Distribui cartas (só o jogador de 11 vê)
         baralho = Baralho()
         baralho.embaralhar()
         mao_11 = baralho.distribuir(3)
@@ -695,32 +883,50 @@ class Partida:
 
         acao = msg.get("acao")
 
+        # ------------------------------------------------
+        # CORRER → adversário ganha 1 ponto
+        # ------------------------------------------------
         if acao == "correr":
             self._log(f"{slot_11} correu da mão de 11.")
             self.valor_mao = 1
-            self.sala.broadcast({
-                "tipo": p.T_FIM_MAO,
-                "vencedor": outro,
-                "pontos": {outro: self.placar[outro] + 1, slot_11: self.placar[slot_11]},
-            })
+            self._pontos_mao_11 = 1
             return outro
 
+        # ------------------------------------------------
+        # JOGAR → mão normal sem truco
+        # ------------------------------------------------
         if acao == "jogar":
             self._log(f"{slot_11} decidiu jogar a mão de 11.")
-            # Joga como mão normal, sem truco
-            return self._jogar_mao_11_normal(slot_11, outro)
+            vencedor = self._jogar_mao_11_normal(slot_11, outro)
+
+            # Regra de pontos:
+            #   - Se o jogador de 11 ganhou → 1 ponto.
+            #   - Se ele perdeu → adversário ganha 3 pontos.
+            if vencedor == slot_11:
+                self._pontos_mao_11 = 1
+            else:
+                self._pontos_mao_11 = 3
+
+            return vencedor
 
         return None
 
-    def _jogar_mao_11_normal(self, slot_11: str, outro: str) -> Optional[str]:
-        """Mão de 11 normal — 3 vazas, SEM truco. Vencedor leva 1 ponto."""
-        # Distribui 3 cartas pro outro também
+    def _jogar_mao_11_normal(
+        self, slot_11: str, outro: str
+    ) -> Optional[str]:
+        """
+        Mão de 11 normal — 3 vazas, SEM truco.
+
+        O vencedor é retornado; o valor dos pontos é decidido
+        pela `_mao_de_11` (1 se o jogador de 11 ganhar, 3 se perder).
+        """
+        # Distribui cartas pro outro também (agora ele vê as dele)
         baralho = Baralho()
         baralho.embaralhar()
         mao_outro = baralho.distribuir(3)
         self.jogadores[outro].mao = [str(c) for c in mao_outro]
 
-        # Envia mao_inicial (sem começar truco)
+        # Envia mao_inicial pro outro (não tem truco nessa mão)
         self.sala.enviar_para(outro, {
             "tipo": p.T_MAO_INICIAL,
             "cartas": [str(c) for c in mao_outro],
@@ -738,12 +944,15 @@ class Partida:
         if self.terminou:
             return None
         if v1 is None:
-            return slot_11  # empate na vaza 1 → vitória de quem começou
+            # Empate na vaza 1 → quem começou leva
+            return slot_11
         self.vitorias_vaza[v1] += 1
         self.quem_ganhou_vaza_1 = v1
 
         # Vaza 2
-        v2 = self._jogar_vaza_sem_truco(2, v1, SLOT2 if v1 == SLOT1 else SLOT1)
+        v2 = self._jogar_vaza_sem_truco(
+            2, v1, SLOT2 if v1 == SLOT1 else SLOT1
+        )
         if self.terminou:
             return None
         if v2 is not None:
@@ -755,7 +964,9 @@ class Partida:
             return SLOT2
 
         # Vaza 3
-        v3 = self._jogar_vaza_sem_truco(3, v1, SLOT2 if v1 == SLOT1 else SLOT1)
+        v3 = self._jogar_vaza_sem_truco(
+            3, v1, SLOT2 if v1 == SLOT1 else SLOT1
+        )
         if self.terminou:
             return None
         if v3 is not None:
@@ -763,38 +974,70 @@ class Partida:
 
         if self.vitorias_vaza[SLOT1] == self.vitorias_vaza[SLOT2]:
             return self.quem_ganhou_vaza_1
-        return SLOT1 if self.vitorias_vaza[SLOT1] > self.vitorias_vaza[SLOT2] else SLOT2
+        if self.vitorias_vaza[SLOT1] > self.vitorias_vaza[SLOT2]:
+            return SLOT1
+        return SLOT2
 
     def _jogar_vaza_sem_truco(
         self, numero: int, comeca: str, outro: str
     ) -> Optional[str]:
-        """Vaza SEM permitir truco (usada na mão de 11)."""
+        """
+        Executa uma vaza SEM permitir truco.
+
+        Usada SOMENTE na mão de 11 — por isso não tem a lógica de
+        truco que existe em `_aguardar_jogada`.
+
+        Se a carta enviada for inválida ou não estiver na mão,
+        devolve erro e continua esperando a jogada correta.
+        """
         self.cartas_na_mesa = {SLOT1: None, SLOT2: None}
 
         for slot in [comeca, outro]:
             if self.terminou:
                 return None
+
             self.sala.enviar_para(slot, {"tipo": p.T_SUA_VEZ})
 
-            msg = self._esperar_mensagem(
-                slot,
-                tipos_validos={p.T_JOGAR},
-                timeout=TIMEOUT_JOGADA,
-            )
-            if self.terminou:
-                return None
-            if msg is None:
+            # Loop interno: só sai quando tiver uma carta válida.
+            carta = None
+            deadline = time.time() + TIMEOUT_JOGADA
+            while time.time() < deadline and not self.terminou:
+                msg = self._esperar_mensagem(
+                    slot,
+                    tipos_validos={p.T_JOGAR},
+                    timeout=deadline - time.time(),
+                )
+                if self.terminou:
+                    return None
+                if msg is None:
+                    self.registrar_wo(slot)
+                    return None
+
+                carta_str = msg.get("carta")
+                try:
+                    carta_tentativa = Carta.from_str(carta_str)
+                except ValueError:
+                    self.sala.enviar_para(slot, {
+                        "tipo": p.T_ERRO,
+                        "codigo": "carta_invalida",
+                        "msg": f"Carta inválida: {carta_str}",
+                    })
+                    continue
+
+                if str(carta_tentativa) not in self.jogadores[slot].mao:
+                    self.sala.enviar_para(slot, {
+                        "tipo": p.T_ERRO,
+                        "codigo": "carta_nao_esta_na_mao",
+                        "msg": f"A carta {carta_tentativa} não está na sua mão.",
+                    })
+                    continue
+
+                carta = carta_tentativa
+                break
+
+            if carta is None:
                 self.registrar_wo(slot)
                 return None
-
-            carta_str = msg.get("carta")
-            try:
-                carta = Carta.from_str(carta_str)
-            except ValueError:
-                continue
-
-            if str(carta) not in self.jogadores[slot].mao:
-                continue
 
             self.jogadores[slot].mao.remove(str(carta))
             self.cartas_na_mesa[slot] = carta
@@ -817,6 +1060,7 @@ class Partida:
                 "vaza": numero,
             })
             return None
+
         vencedor = SLOT1 if r > 0 else SLOT2
         self.sala.broadcast({
             "tipo": p.T_RESULTADO_VAZA,
@@ -830,26 +1074,32 @@ class Partida:
     # ========================================================
 
     def _mao_de_ferro(self) -> Optional[str]:
-        """Mão de ferro — sem ver as cartas. Vale 1 ponto."""
+        """
+        Mão de ferro (ambos com 11 pontos).
+
+        Regras:
+            - Ninguém vê as cartas — só escolhe o ÍNDICE (0, 1, 2).
+            - Vale 1 ponto.
+            - Se empatar, roda OUTRA mão de ferro (loop até desempatar).
+        """
         self._log("--- MÃO DE FERRO ---")
 
         self.valor_mao = 1
+        self._em_mao_de_11 = True  # bloqueia truco nessa mão também
 
         while not self.terminou:
-            # Distribui 3 cartas (ninguém vê)
+            # Nova distribuição a cada iteração (empate = novo jogo)
             baralho = Baralho()
             baralho.embaralhar()
             for slot in [SLOT1, SLOT2]:
                 mao = baralho.distribuir(3)
                 self.jogadores[slot].mao = [str(c) for c in mao]
 
-            # Avisa os dois
             self.sala.broadcast({
                 "tipo": p.T_MAO_DE_FERRO,
                 "pontos": dict(self.placar),
             })
 
-            # Loop de 3 vazas sem mostrar cartas
             self.vitorias_vaza = {SLOT1: 0, SLOT2: 0}
             self.quem_ganhou_vaza_1 = None
 
@@ -858,6 +1108,7 @@ class Partida:
                 return None
 
             if resultado is None:
+                # Empate total → joga de novo
                 self._log("Mão de ferro empatou → nova mão de ferro.")
                 continue
 
@@ -872,7 +1123,16 @@ class Partida:
         return None
 
     def _jogar_ferro_3_vazas(self) -> Optional[str]:
-        """Joga 3 vazas da mão de ferro. Retorna vencedor ou None (empate)."""
+        """
+        Joga as 3 vazas da mão de ferro.
+
+        Os jogadores só mandam o índice (0, 1, 2) da carta escolhida.
+        O servidor resolve silenciosamente (sem revelar as cartas).
+
+        Retorna:
+            - slot vencedor (SLOT1/SLOT2)
+            - None se houve empate total (força nova mão de ferro)
+        """
         comeca = self.comeca_mao
 
         for numero in range(1, 4):
@@ -903,13 +1163,12 @@ class Partida:
                     })
                     continue
 
-                # Pega a carta no índice informado
                 carta_str = self.jogadores[slot].mao[indice]
                 cartas[slot] = Carta.from_str(carta_str)
 
-            # Resolve a vaza
             if cartas[SLOT1] is None or cartas[SLOT2] is None:
                 return None
+
             r = comparar(cartas[SLOT1], cartas[SLOT2])
 
             if r > 0:
@@ -937,8 +1196,9 @@ class Partida:
                     "vaza": numero,
                 })
 
-            # Empate total → repete
-            if self.vitorias_vaza[SLOT1] == self.vitorias_vaza[SLOT2] and numero == 3:
+            # Empate total na 3ª vaza → nova mão de ferro
+            if (self.vitorias_vaza[SLOT1] == self.vitorias_vaza[SLOT2]
+                    and numero == 3):
                 return None
 
             if self.vitorias_vaza[SLOT1] == 2:
@@ -946,10 +1206,10 @@ class Partida:
             if self.vitorias_vaza[SLOT2] == 2:
                 return SLOT2
 
-            # Alterna quem começa
+            # Alterna quem começa na próxima vaza
             comeca = SLOT2 if comeca == SLOT1 else SLOT1
 
-        # Chegou no fim das 3 vazas
+        # Acabaram as 3 vazas
         if self.vitorias_vaza[SLOT1] > self.vitorias_vaza[SLOT2]:
             return SLOT1
         if self.vitorias_vaza[SLOT2] > self.vitorias_vaza[SLOT1]:
@@ -969,9 +1229,18 @@ class Partida:
         """
         Espera uma mensagem de um tipo válido vinda do jogador 'slot'.
 
-        - Consome da fila do jogador (jogador.fila).
-        - Mensagens de tipo inválido → envia erro e continua.
-        - Timeout → retorna None.
+        Como funciona a sincronização:
+            - Cada jogador tem uma fila (jogador.fila).
+            - A thread leitora da Sala insere mensagens nessa fila e
+              chama `sala.condicao.notify_all()`.
+            - Aqui, tentamos tirar da fila sem bloquear (`get_nowait`).
+            - Se estiver vazia, dormimos em `condicao.wait()` até
+              alguém notificar (ou até dar timeout curto).
+
+        Mensagens com tipo inválido geram erro pro cliente e o
+        loop continua esperando.
+
+        Retorna a mensagem (dict) ou None em caso de timeout.
         """
         if timeout <= 0:
             return None
@@ -980,10 +1249,10 @@ class Partida:
         fila = self.jogadores[slot].fila
 
         while time.time() < deadline and not self.terminou:
-            # Tenta tirar algo da fila sem bloquear
             try:
                 msg = fila.get_nowait()
             except queue.Empty:
+                # Fila vazia: dorme até ser notificado
                 with self.sala.condicao:
                     self.sala.condicao.wait(timeout=0.5)
                 continue
@@ -992,7 +1261,6 @@ class Partida:
             if tipo in tipos_validos:
                 return msg
 
-            # Tipo inesperado → erro
             self.sala.enviar_para(slot, {
                 "tipo": p.T_ERRO,
                 "codigo": "acao_invalida",
@@ -1006,7 +1274,13 @@ class Partida:
     # ========================================================
 
     def registrar_wo(self, slot: str) -> None:
-        """Registra WO de um jogador. O adversário vence a partida."""
+        """
+        Registra WO de um jogador (desconexão ou timeout).
+
+        Efeito: adversário vence a partida independente de pontos.
+        O `notify_all` acorda qualquer thread que estiver esperando
+        na condição (por exemplo, `_esperar_mensagem`).
+        """
         if self.terminou:
             return
         outro = SLOT2 if slot == SLOT1 else SLOT1
@@ -1025,7 +1299,9 @@ class Partida:
             else:
                 vencedor = SLOT2
 
-        self._log(f"FIM DA PARTIDA: {vencedor} venceu! Placar: {self.placar}")
+        self._log(
+            f"FIM DA PARTIDA: {vencedor} venceu! Placar: {self.placar}"
+        )
         self.sala.broadcast({
             "tipo": p.T_FIM_PARTIDA,
             "vencedor": vencedor,
@@ -1039,6 +1315,7 @@ class Partida:
     # ========================================================
 
     def _enviar_mao_inicial(self) -> None:
+        """Envia a mão inicial pra cada jogador com o placar atual."""
         for slot, jog in self.jogadores.items():
             self.sala.enviar_para(slot, {
                 "tipo": p.T_MAO_INICIAL,
@@ -1050,5 +1327,3 @@ class Partida:
     def _log(self, texto: str) -> None:
         if DEBUG:
             print(f"[PARTIDA {self.sala.id}] {texto}")
-
-#teste
